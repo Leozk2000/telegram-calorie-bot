@@ -1,0 +1,10 @@
+{
+  "name": "free-n8n-bot",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "n8n"
+  },
+  "dependencies": {
+    "n8n": "latest"
+  }
+}
