@@ -93,8 +93,17 @@ def run_flask():
     app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
-    # Start the web page helper in a background process thread
+    # STARTUP FIXED LOOP: Destroys ghost connections before launching the main thread
+    try:
+        print("🧼 Cleaning up old server connections...")
+        bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        print(f"Webhook cleanup warning: {e}")
+        
+    # Start the web page scanner helper in a background thread
     threading.Thread(target=run_flask, daemon=True).start()
     
     print("🚀 Bot server running with active web listener...")
-    bot.infinity_polling()
+    # Fixes the 409 error by instructing Telegram to kick off any old stale containers
+    bot.infinity_polling(skip_pending=True)
+
