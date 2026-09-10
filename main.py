@@ -2,7 +2,7 @@ import os
 import json
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import telebot
 import google.genai as genai
 import gspread
@@ -23,6 +23,15 @@ client_ai = genai.Client(api_key=GEMINI_KEY)
 creds_dict = json.loads(GOOGLE_CREDS_JSON)
 client_sheet = gspread.service_account_from_dict(creds_dict)
 sheet = client_sheet.open("Calorie Tracker Logs").sheet1
+
+# Render's servers run in UTC by default, but we want log timestamps to
+# reflect Singapore local time (GMT+8) regardless of where the container
+# actually runs.
+SGT = timezone(timedelta(hours=8))
+
+def now_sgt() -> datetime:
+    """Current time as a timezone-aware datetime in Singapore (GMT+8)."""
+    return datetime.now(timezone.utc).astimezone(SGT)
 
 def download_telegram_file(file_path: str, token: str, timeout: int = 15, retries: int = 3) -> bytes:
     """
@@ -143,7 +152,7 @@ def handle_food_photo(message):
                 data = json.loads(json_string)
                 
                 sheet.append_row([
-                    str(datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                    str(now_sgt().strftime("%Y-%m-%d %H:%M:%S")),
                     str(message.from_user.id),
                     data.get("meal"),
                     data.get("calories"),
@@ -178,13 +187,79 @@ def handle_food_photo(message):
             bot.reply_to(message, error_message)
 
 
-# HANDLER 2: Text Response Assistant
+# HANDLER 2: Daily Tally Command
+# Usage:
+#   /total            -> tallies today's meals (SGT)
+#   /total 2026-09-09 -> tallies meals for that specific date (SGT)
+@bot.message_handler(commands=['total', 'today'])
+def handle_daily_total(message):
+    try:
+        user_id = str(message.from_user.id)
+
+        parts = message.text.strip().split(maxsplit=1)
+        if len(parts) > 1:
+            target_date = parts[1].strip()
+            # Basic sanity check on the format so a typo doesn't silently
+            # match zero rows without explanation.
+            try:
+                datetime.strptime(target_date, "%Y-%m-%d")
+            except ValueError:
+                bot.reply_to(message, "⚠️ Please use the format `/total YYYY-MM-DD`.", parse_mode="Markdown")
+                return
+        else:
+            target_date = now_sgt().strftime("%Y-%m-%d")
+
+        records = sheet.get_all_records()
+
+        total_cal = total_protein = total_carbs = total_fat = 0.0
+        meal_count = 0
+
+        for row in records:
+            row_date = str(row.get("Date", ""))[:10]
+            row_user = str(row.get("Telegram_ID", ""))
+            if row_date == target_date and row_user == user_id:
+                total_cal += float(row.get("Calories") or 0)
+                total_protein += float(row.get("Protein") or 0)
+                total_carbs += float(row.get("Carbs") or 0)
+                # Column is labeled "Fats" in the sheet; fall back to "Fat"
+                # just in case the header ever gets singularized.
+                total_fat += float(row.get("Fats", row.get("Fat")) or 0)
+                meal_count += 1
+
+        if meal_count == 0:
+            bot.reply_to(message, f"No meals logged for {target_date}. 🍽️")
+            return
+
+        summary = (
+            f"📊 *Daily Total — {target_date}*\n\n"
+            f"🍱 Meals logged: {meal_count}\n"
+            f"🔥 Calories: {total_cal:.0f} kcal\n"
+            f"💪 Protein: {total_protein:.0f} g\n"
+            f"🍞 Carbs: {total_carbs:.0f} g\n"
+            f"🥑 Fat: {total_fat:.0f} g"
+        )
+        try:
+            bot.reply_to(message, summary, parse_mode="Markdown")
+        except telebot.apihelper.ApiTelegramException:
+            bot.reply_to(message, summary)
+
+    except Exception as e:
+        print(f"⚠️ Failed to compute daily total: {e}")
+        error_message = f"❌ *Couldn't compute your daily total*\n\nReason:\n`{str(e)}`"
+        try:
+            bot.reply_to(message, error_message, parse_mode="Markdown")
+        except telebot.apihelper.ApiTelegramException:
+            bot.reply_to(message, error_message)
+
+
+# HANDLER 3: Text Response Assistant
 @bot.message_handler(content_types=['text'])
 def handle_text_fallback(message):
     feedback = (
         "🍳 *Calorie Tracker Bot Ready!*\n\n"
         "Please upload a **photo** of your plate. "
-        "The AI will evaluate macros and save them straight to your tracking sheet! 📊"
+        "The AI will evaluate macros and save them straight to your tracking sheet! 📊\n\n"
+        "Send /total to see today's tally, or /total YYYY-MM-DD for a specific day."
     )
     bot.reply_to(message, feedback, parse_mode="Markdown")
 
