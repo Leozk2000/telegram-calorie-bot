@@ -1,0 +1,6 @@
+pyTelegramBotAPI
+google-genai
+gspread
+google-auth
+pillow
+requests
