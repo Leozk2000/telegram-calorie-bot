@@ -83,8 +83,7 @@ def handle_food_photo(message):
     except Exception as e:
         import traceback
         error_details = traceback.format_exc()
-        print(f"❌ Execution crash:\n{error_details}")
-        
+        print(f"❌ Execution crash:\n{error_details}")        
         # DEFINITIVE DIAGNOSTIC FIX: Text the exact internal issue straight to your phone!
         bot.reply_to(message, f"❌ *Error Processing Meal Card*\n\nReason:\n`{str(e)}`", parse_mode="Markdown")
 
