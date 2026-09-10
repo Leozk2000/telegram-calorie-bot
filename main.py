@@ -94,7 +94,14 @@ def handle_food_photo(message):
         img = Image.open(BytesIO(file_bytes))
         
         ai_response = client_ai.models.generate_content(
-            model='gemini-1.5-flash',
+            # Using the rolling alias instead of a pinned version so this
+            # doesn't need manual updates every time Google retires a model.
+            # Trade-off: Google has, in the past, let this alias point at a
+            # model that was later deprecated, which reintroduces a 404 until
+            # Google repoints the alias. If that happens, check
+            # https://ai.google.dev/gemini-api/docs/changelog for the current
+            # recommended Flash model and pin to it directly as a workaround.
+            model='gemini-flash-latest',
             contents=[img, SYSTEM_PROMPT]
         )
         full_text = ai_response.text
