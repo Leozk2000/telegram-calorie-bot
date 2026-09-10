@@ -155,14 +155,27 @@ def handle_food_photo(message):
         except Exception as sheet_error:
             print(f"⚠️ Sheets logging skipped: {sheet_error}")
             
-        bot.reply_to(message, full_text, parse_mode="Markdown")
+        try:
+            bot.reply_to(message, full_text, parse_mode="Markdown")
+        except telebot.apihelper.ApiTelegramException as markdown_error:
+            # Gemini-generated text can contain unbalanced Markdown (e.g. an
+            # unmatched *) that Telegram's parser rejects with a 400. Rather
+            # than crash the whole handler over a formatting glitch, fall
+            # back to sending the same text with no formatting at all so the
+            # user still gets their meal info.
+            print(f"⚠️ Markdown parse failed ({markdown_error}); resending as plain text.")
+            bot.reply_to(message, full_text)
         
     except Exception as e:
         import traceback
         error_details = traceback.format_exc()
         print(f"❌ Execution crash:\n{error_details}")        
         # DEFINITIVE DIAGNOSTIC FIX: Text the exact internal issue straight to your phone!
-        bot.reply_to(message, f"❌ *Error Processing Meal Card*\n\nReason:\n`{str(e)}`", parse_mode="Markdown")
+        error_message = f"❌ *Error Processing Meal Card*\n\nReason:\n`{str(e)}`"
+        try:
+            bot.reply_to(message, error_message, parse_mode="Markdown")
+        except telebot.apihelper.ApiTelegramException:
+            bot.reply_to(message, error_message)
 
 
 # HANDLER 2: Text Response Assistant
