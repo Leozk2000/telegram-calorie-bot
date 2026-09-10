@@ -42,28 +42,31 @@ Second, right below the JSON block, write a beautiful, clean summary text card f
 @bot.message_handler(content_types=['photo'])
 def handle_food_photo(message):
     try:
+        print(f"📸 Received photo from User ID {message.from_user.id}. Starting AI evaluation...")
         bot.reply_to(message, "Analyzing your meal... 🔍")
         
-        # Download image from Telegram API
+        # 1. Download photo from Telegram API cleanly
         file_info = bot.get_file(message.photo[-1].file_id)
-        # FIX: Explicitly separating the base endpoint from the token with clear slashes
-        file_url = f"https://telegram.org{TELEGRAM_TOKEN.strip()}/{file_info.file_path}"
+        file_url = f"https://telegram.org{TELEGRAM_TOKEN}/{file_info.file_path}"
         response = requests.get(file_url)
         img = Image.open(BytesIO(response.content))
         
-        # Call Gemini API for cloud vision processing
+        # 2. Call Gemini API for cloud vision processing
         ai_response = client_ai.models.generate_content(
             model='gemini-1.5-flash',
             contents=[img, SYSTEM_PROMPT]
         )
         full_text = ai_response.text
         
-        # Parse JSON and log to Google Sheet
+        # 3. FIXED TEXT PARSING: Safely extract JSON data for Google Sheets
         try:
             if "```json" in full_text:
-                json_part = full_text.split("```json").split("```").strip()
-                data = json.loads(json_part)
+                # Split text cleanly using index placement instead of double-splitting a list
+                parts = full_text.split("```json")
+                json_string = parts[1].split("```")[0].strip()
+                data = json.loads(json_string)
                 
+                # Append rows to Google Sheet logs
                 sheet.append_row([
                     str(datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
                     str(message.from_user.id),
@@ -73,13 +76,17 @@ def handle_food_photo(message):
                     data.get("carbs"),
                     data.get("fat")
                 ])
-        except Exception as e:
-            print(f"Sheet error: {e}")
+                print("✅ Log successfully saved to Google Sheets.")
+        except Exception as sheet_error:
+            print(f"⚠️ Google Sheets entry skipped or failed: {sheet_error}")
             
+        # 4. Reply back to your phone with the pretty text card layout
         bot.reply_to(message, full_text, parse_mode="Markdown")
         
     except Exception as e:
+        print(f"❌ Core processing error: {e}")
         bot.reply_to(message, f"Error processing meal: {str(e)}")
+
 
 # PORT BINDING FIX: Create a tiny dummy web page for Render's scanner
 app = Flask(__name__)
