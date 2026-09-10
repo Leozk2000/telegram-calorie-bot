@@ -46,7 +46,8 @@ def handle_food_photo(message):
         
         # Download image from Telegram API
         file_info = bot.get_file(message.photo[-1].file_id)
-        file_url = f"https://telegram.org{TELEGRAM_TOKEN}/{file_info.file_path}"
+        # FIX: Explicitly separating the base endpoint from the token with clear slashes
+        file_url = f"https://telegram.org{TELEGRAM_TOKEN.strip()}/{file_info.file_path}"
         response = requests.get(file_url)
         img = Image.open(BytesIO(response.content))
         
