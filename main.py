@@ -8,7 +8,7 @@ from PIL import Image
 import requests
 from io import BytesIO
 
-# Initialize credentials securely from environment variables
+# 1. Fetch credentials securely from Render's Environment Variables
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_KEY = os.environ.get("GEMINI_KEY")
 GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDS")
@@ -16,7 +16,7 @@ GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDS")
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 client_ai = genai.Client(api_key=GEMINI_KEY)
 
-# Connect to Google Sheets database natively via JSON dict parsing
+# 2. Authenticate Google Sheets
 creds_dict = json.loads(GOOGLE_CREDS_JSON)
 client_sheet = gspread.service_account_from_dict(creds_dict)
 sheet = client_sheet.open("Calorie Tracker Logs").sheet1
@@ -42,23 +42,23 @@ def handle_food_photo(message):
     try:
         bot.reply_to(message, "Analyzing your meal... 🔍")
         
-        # Pull image binary direct from Telegram
+        # Download image from Telegram API
         file_info = bot.get_file(message.photo[-1].file_id)
         file_url = f"https://telegram.org{TELEGRAM_TOKEN}/{file_info.file_path}"
         response = requests.get(file_url)
         img = Image.open(BytesIO(response.content))
         
-        # Forward data payload to Gemini API
+        # Call Gemini API for cloud vision processing
         ai_response = client_ai.models.generate_content(
             model='gemini-1.5-flash',
             contents=[img, SYSTEM_PROMPT]
         )
         full_text = ai_response.text
         
-        # Parse the data payload strings back into database columns
+        # Parse JSON and log to Google Sheet
         try:
             if "```json" in full_text:
-                json_part = full_text.split("```json")[1].split("```")[0].strip()
+                json_part = full_text.split("```json").split("```").strip()
                 data = json.loads(json_part)
                 
                 sheet.append_row([
@@ -71,7 +71,7 @@ def handle_food_photo(message):
                     data.get("fat")
                 ])
         except Exception as e:
-            print(f"Database logging skipped: {e}")
+            print(f"Sheet error: {e}")
             
         bot.reply_to(message, full_text, parse_mode="Markdown")
         
@@ -79,5 +79,5 @@ def handle_food_photo(message):
         bot.reply_to(message, f"Error processing meal: {str(e)}")
 
 if __name__ == "__main__":
-    print("Calorie Counter Script started successfully. Listening for photos...")
+    print("🚀 Bot server running on lightweight Python memory footprint...")
     bot.infinity_polling()
