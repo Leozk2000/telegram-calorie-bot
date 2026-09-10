@@ -24,6 +24,49 @@ creds_dict = json.loads(GOOGLE_CREDS_JSON)
 client_sheet = gspread.service_account_from_dict(creds_dict)
 sheet = client_sheet.open("Calorie Tracker Logs").sheet1
 
+def download_telegram_file(file_path: str, token: str, timeout: int = 15, retries: int = 3) -> bytes:
+    """
+    Ultra-robust downloader for Telegram file content.
+
+    Correct endpoint shape (this was the actual bug):
+        https://api.telegram.org/file/bot<TOKEN>/<file_path>
+
+    Guards against:
+      - missing/empty token or file_path
+      - accidental whitespace/newlines in the token (common when pasted into
+        Render's env var UI)
+      - transient network errors / timeouts (retried with backoff)
+      - non-200 responses or empty bodies
+    """
+    if not token or not token.strip():
+        raise ValueError("TELEGRAM_TOKEN is missing or empty.")
+    if not file_path:
+        raise ValueError("file_path from get_file() is missing or empty.")
+
+    # Defensive cleanup: strips stray whitespace/newlines that sometimes get
+    # copy-pasted into env vars, without altering a valid token.
+    clean_token = token.strip()
+
+    url = f"https://api.telegram.org/file/bot{clean_token}/{file_path}"
+
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.get(url, timeout=timeout)
+            if resp.status_code != 200:
+                raise requests.exceptions.HTTPError(
+                    f"Telegram file server returned HTTP {resp.status_code}: {resp.text[:200]}"
+                )
+            if not resp.content:
+                raise ValueError("Downloaded file content is empty.")
+            return resp.content
+        except (requests.exceptions.RequestException, ValueError) as e:
+            last_error = e
+            print(f"⚠️ Download attempt {attempt}/{retries} failed: {e}")
+
+    raise RuntimeError(f"Failed to download Telegram file after {retries} attempts: {last_error}")
+
+
 SYSTEM_PROMPT = """
 You are an expert nutritionist AI. Analyze the uploaded meal photo or text.
 Estimate portion sizes and calculate macros. 
@@ -48,9 +91,8 @@ def handle_food_photo(message):
         bot.reply_to(message, "Analyzing your meal... 🔍")
         
         file_info = bot.get_file(message.photo[-1].file_id)
-        file_url = f"https://telegram.org{TELEGRAM_TOKEN}/{file_info.file_path}"
-        response = requests.get(file_url)
-        img = Image.open(BytesIO(response.content))
+        file_bytes = download_telegram_file(file_info.file_path, TELEGRAM_TOKEN)
+        img = Image.open(BytesIO(file_bytes))
         
         ai_response = client_ai.models.generate_content(
             model='gemini-1.5-flash',
