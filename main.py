@@ -1,12 +1,14 @@
 import os
 import json
 from datetime import datetime
+import threading
 import telebot
 import google.genai as genai
 import gspread
 from PIL import Image
 import requests
 from io import BytesIO
+from flask import Flask
 
 # 1. Fetch credentials securely from Render's Environment Variables
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -16,7 +18,7 @@ GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDS")
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 client_ai = genai.Client(api_key=GEMINI_KEY)
 
-# 2. Authenticate Google Sheets
+# Authenticate Google Sheets
 creds_dict = json.loads(GOOGLE_CREDS_JSON)
 client_sheet = gspread.service_account_from_dict(creds_dict)
 sheet = client_sheet.open("Calorie Tracker Logs").sheet1
@@ -78,6 +80,20 @@ def handle_food_photo(message):
     except Exception as e:
         bot.reply_to(message, f"Error processing meal: {str(e)}")
 
+# PORT BINDING FIX: Create a tiny dummy web page for Render's scanner
+app = Flask(__name__)
+@app.route('/')
+def home():
+    return "Bot is running healthy!"
+
+def run_flask():
+    # Render automatically injects a PORT variable into the environment
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
 if __name__ == "__main__":
-    print("🚀 Bot server running on lightweight Python memory footprint...")
+    # Start the web page helper in a background process thread
+    threading.Thread(target=run_flask, daemon=True).start()
+    
+    print("🚀 Bot server running with active web listener...")
     bot.infinity_polling()
