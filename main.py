@@ -145,13 +145,14 @@ def handle_food_photo(message):
         full_text = ai_response.text
         
         # SAFE EXTRACT FIX: Uses safe text regular expressions instead of list splitting
+        logged_row = None  # row number in the sheet, used later to attach the price
         try:
             match = re.search(r'```json\s*(\{.*?\})\s*```', full_text, re.DOTALL)
             if match:
                 json_string = match.group(1)
                 data = json.loads(json_string)
                 
-                sheet.append_row([
+                append_result = sheet.append_row([
                     str(now_sgt().strftime("%Y-%m-%d %H:%M:%S")),
                     str(message.from_user.id),
                     data.get("meal"),
@@ -160,6 +161,15 @@ def handle_food_photo(message):
                     data.get("carbs"),
                     data.get("fat")
                 ])
+                # gspread's append_row response includes something like
+                # {"updates": {"updatedRange": "Sheet1!A12:G12", ...}}.
+                # We pull the row number out of that so we can target the
+                # exact same row later when the price comes back, without
+                # re-scanning the whole sheet.
+                updated_range = append_result.get("updates", {}).get("updatedRange", "")
+                row_match = re.search(r'![A-Z]+(\d+)', updated_range)
+                if row_match:
+                    logged_row = int(row_match.group(1))
                 print("✅ Entry securely added to your Google Sheet.")
         except Exception as sheet_error:
             print(f"⚠️ Sheets logging skipped: {sheet_error}")
@@ -174,6 +184,17 @@ def handle_food_photo(message):
             # user still gets their meal info.
             print(f"⚠️ Markdown parse failed ({markdown_error}); resending as plain text.")
             bot.reply_to(message, full_text)
+
+        # Follow up asking for the price, but only if we know which row to
+        # attach it to. The reply is validated with a strict regex and cast
+        # to a float before it ever reaches Gemini or the sheet — it's never
+        # treated as an instruction or a formula, just a number.
+        if logged_row is not None:
+            prompt_msg = bot.send_message(
+                message.chat.id,
+                "💰 How much did this meal cost? Reply with a number (e.g. 12.50), or send /skip."
+            )
+            bot.register_next_step_handler(prompt_msg, handle_price_reply, logged_row)
         
     except Exception as e:
         import traceback
@@ -187,7 +208,129 @@ def handle_food_photo(message):
             bot.reply_to(message, error_message)
 
 
-# HANDLER 2: Daily Tally Command
+# Matches an optional leading "$", digits, and an optional 1-2 decimal
+# places — nothing else. Anything that doesn't fully match this (extra
+# words, symbols, formula-like prefixes such as "=", "+", "@") is rejected
+# outright rather than partially parsed.
+PRICE_PATTERN = re.compile(r'^\$?\d+(\.\d{1,2})?$')
+
+def handle_price_reply(message, row_number):
+    """
+    Next-step handler for the price follow-up. The reply is treated purely
+    as data, never as an instruction: it's validated against a strict regex
+    and converted to a float before being written anywhere. It never gets
+    passed to Gemini, and writing it as a float (not a raw string) means
+    Sheets can't misinterpret it as a formula even if someone typed
+    something formula-shaped.
+    """
+    text = (message.text or "").strip()
+
+    # Batch uploads aren't supported: if a second photo comes in while we're
+    # still waiting on the price for the previous one, telebot's next-step
+    # mechanism routes it here (not to the photo handler) since it's the
+    # very next message in this chat. Reject it and re-ask for the pending
+    # price instead of silently dropping or processing the new photo.
+    if message.content_type == 'photo':
+        retry_msg = bot.reply_to(
+            message,
+            "⚠️ Please answer the price for your last meal first (or send /skip), "
+            "before uploading another photo."
+        )
+        bot.register_next_step_handler(retry_msg, handle_price_reply, row_number)
+        return
+
+    # Let /delete or /undo interrupt the price flow too — this is exactly
+    # the "I uploaded the wrong photo" moment, so it should work here rather
+    # than being swallowed as an invalid price reply.
+    if text.lower() in ("/delete", "/undo"):
+        handle_delete_last_entry(message)
+        return
+
+    if text.lower() == "/skip":
+        bot.reply_to(message, "Okay, skipped — no price logged for this meal.")
+        return
+
+    if not PRICE_PATTERN.match(text):
+        retry_msg = bot.reply_to(
+            message,
+            "⚠️ That doesn't look like a plain number. Please reply with just the amount "
+            "(e.g. 12.50), or send /skip."
+        )
+        bot.register_next_step_handler(retry_msg, handle_price_reply, row_number)
+        return
+
+    price = float(text.lstrip("$"))
+
+    try:
+        # Column 8 = "Price", one column to the right of the existing
+        # Date/Telegram_ID/Meal/Calories/Protein/Carbs/Fats columns (A-G).
+        sheet.update_cell(row_number, 8, price)
+        bot.reply_to(message, f"💰 Logged ${price:.2f} for this meal.")
+    except Exception as e:
+        print(f"⚠️ Failed to log price: {e}")
+        bot.reply_to(message, f"❌ Couldn't save the price to the sheet.\nReason: `{str(e)}`", parse_mode="Markdown")
+
+
+# HANDLER 2: Delete Last Entry (with ownership + time-window guardrails)
+# Usage: /delete or /undo — removes the sender's own most recent entry,
+# but only if it's less than 1 hour old.
+DELETE_WINDOW = timedelta(hours=1)
+
+def handle_delete_last_entry(message):
+    try:
+        user_id = str(message.from_user.id)
+        records = sheet.get_all_records()
+
+        # Scan for the last row belonging to this user. Since entries are
+        # appended in order, the last match is the most recent one — we
+        # never touch a row that isn't this user's, so there's no way to
+        # delete someone else's entry even by accident.
+        target_index = None
+        for i, row in enumerate(records):
+            if str(row.get("Telegram_ID", "")) == user_id:
+                target_index = i
+
+        if target_index is None:
+            bot.reply_to(message, "You don't have any logged meals to delete.")
+            return
+
+        row_data = records[target_index]
+        row_number = target_index + 2  # +1 for the header row, +1 for 1-indexing
+
+        try:
+            logged_time = datetime.strptime(str(row_data.get("Date", "")), "%Y-%m-%d %H:%M:%S")
+            logged_time = logged_time.replace(tzinfo=SGT)
+        except ValueError:
+            bot.reply_to(message, "⚠️ Couldn't read the timestamp on that entry, so it won't be deleted.")
+            return
+
+        age = now_sgt() - logged_time
+        if age > DELETE_WINDOW:
+            bot.reply_to(
+                message,
+                f"⏳ Your most recent entry (\"{row_data.get('Meal', 'that meal')}\") is over an hour "
+                "old, so it can no longer be deleted with this command."
+            )
+            return
+
+        sheet.delete_rows(row_number)
+        bot.reply_to(message, f"🗑️ Deleted your last entry: \"{row_data.get('Meal', 'that meal')}\".")
+
+    except Exception as e:
+        print(f"⚠️ Failed to delete entry: {e}")
+        error_message = f"❌ *Couldn't delete the entry*\n\nReason:\n`{str(e)}`"
+        try:
+            bot.reply_to(message, error_message, parse_mode="Markdown")
+        except telebot.apihelper.ApiTelegramException:
+            bot.reply_to(message, error_message)
+
+
+@bot.message_handler(commands=['delete', 'undo'])
+def handle_delete_command(message):
+    handle_delete_last_entry(message)
+
+
+# HANDLER 3: Daily Tally Command
 # Usage:
 #   /total            -> tallies today's meals (SGT)
 #   /total 2026-09-09 -> tallies meals for that specific date (SGT)
@@ -252,14 +395,15 @@ def handle_daily_total(message):
             bot.reply_to(message, error_message)
 
 
-# HANDLER 3: Text Response Assistant
+# HANDLER 4: Text Response Assistant
 @bot.message_handler(content_types=['text'])
 def handle_text_fallback(message):
     feedback = (
         "🍳 *Calorie Tracker Bot Ready!*\n\n"
         "Please upload a **photo** of your plate. "
         "The AI will evaluate macros and save them straight to your tracking sheet! 📊\n\n"
-        "Send /total to see today's tally, or /total YYYY-MM-DD for a specific day."
+        "Send /total to see today's tally, or /total YYYY-MM-DD for a specific day.\n"
+        "Uploaded the wrong photo? Send /delete within an hour to remove it."
     )
     bot.reply_to(message, feedback, parse_mode="Markdown")
 
@@ -310,6 +454,17 @@ if __name__ == "__main__":
     bot.remove_webhook()
     bot.set_webhook(url=full_webhook_url)
     print(f"✅ Webhook registered at {full_webhook_url}")
+
+    # Populates the "/" command menu shown in the Telegram chat UI (tap the
+    # icon next to the message box, or type "/" to see it pop up). This is
+    # purely cosmetic/discoverability — it doesn't affect routing, so the
+    # @bot.message_handler(commands=[...]) handlers still do the real work.
+    bot.set_my_commands([
+        telebot.types.BotCommand("total", "Today's nutrition tally"),
+        telebot.types.BotCommand("today", "Same as /total"),
+        telebot.types.BotCommand("delete", "Delete your last entry (within 1h)"),
+    ])
+    print("✅ Command menu registered")
 
     print("🚀 Bot server running via webhook (no polling, no 409 conflicts)...")
     run_flask()  # run in the main thread now — this IS the server
