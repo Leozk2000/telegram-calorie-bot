@@ -10,6 +10,9 @@ from PIL import Image
 import requests
 from io import BytesIO
 from flask import Flask, request, abort
+import matplotlib
+matplotlib.use("Agg")  # headless backend - no display available on Render
+import matplotlib.pyplot as plt
 
 # 1. Fetch credentials securely from Render's Environment Variables
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -32,6 +35,24 @@ SGT = timezone(timedelta(hours=8))
 def now_sgt() -> datetime:
     """Current time as a timezone-aware datetime in Singapore (GMT+8)."""
     return datetime.now(timezone.utc).astimezone(SGT)
+
+# In-memory mirror of the sheet's rows (list of dicts, same shape as
+# sheet.get_all_records()). Every command reads from this instead of
+# calling the Sheets API directly, so a growing sheet doesn't mean a
+# growing full-table read on every /total, /delete, or /graph* command.
+# This assumes a single running instance, which matches this app's Render
+# free-tier deployment — the cache is kept in sync by updating it at the
+# same time as every write the bot itself makes (append/update/delete).
+# If the sheet is ever edited by hand outside the bot, run /refresh to
+# force a full re-sync.
+sheet_cache = []
+
+def load_cache():
+    """(Re)loads the entire sheet into memory. This is the ONLY place a
+    full-table Sheets read happens — at startup, and on-demand via /refresh."""
+    global sheet_cache
+    sheet_cache = sheet.get_all_records()
+    print(f"✅ Cache loaded: {len(sheet_cache)} rows")
 
 def download_telegram_file(file_path: str, token: str, timeout: int = 15, retries: int = 3) -> bytes:
     """
@@ -152,14 +173,19 @@ def handle_food_photo(message):
                 json_string = match.group(1)
                 data = json.loads(json_string)
                 
+                new_row = {
+                    "Date": str(now_sgt().strftime("%Y-%m-%d %H:%M:%S")),
+                    "Telegram_ID": str(message.from_user.id),
+                    "Meal": data.get("meal"),
+                    "Calories": data.get("calories"),
+                    "Protein": data.get("protein"),
+                    "Carbs": data.get("carbs"),
+                    "Fats": data.get("fat"),
+                    "Price": "",  # filled in later by the price follow-up, if answered
+                }
                 append_result = sheet.append_row([
-                    str(now_sgt().strftime("%Y-%m-%d %H:%M:%S")),
-                    str(message.from_user.id),
-                    data.get("meal"),
-                    data.get("calories"),
-                    data.get("protein"),
-                    data.get("carbs"),
-                    data.get("fat")
+                    new_row["Date"], new_row["Telegram_ID"], new_row["Meal"],
+                    new_row["Calories"], new_row["Protein"], new_row["Carbs"], new_row["Fats"]
                 ])
                 # gspread's append_row response includes something like
                 # {"updates": {"updatedRange": "Sheet1!A12:G12", ...}}.
@@ -170,6 +196,7 @@ def handle_food_photo(message):
                 row_match = re.search(r'![A-Z]+(\d+)', updated_range)
                 if row_match:
                     logged_row = int(row_match.group(1))
+                    sheet_cache.append(new_row)  # keep the in-memory cache in sync
                 print("✅ Entry securely added to your Google Sheet.")
         except Exception as sheet_error:
             print(f"⚠️ Sheets logging skipped: {sheet_error}")
@@ -265,6 +292,9 @@ def handle_price_reply(message, row_number):
         # Column 8 = "Price", one column to the right of the existing
         # Date/Telegram_ID/Meal/Calories/Protein/Carbs/Fats columns (A-G).
         sheet.update_cell(row_number, 8, price)
+        cache_index = row_number - 2  # -1 for the header row, -1 for 0-indexing
+        if 0 <= cache_index < len(sheet_cache):
+            sheet_cache[cache_index]["Price"] = price
         bot.reply_to(message, f"💰 Logged ${price:.2f} for this meal.")
     except Exception as e:
         print(f"⚠️ Failed to log price: {e}")
@@ -279,7 +309,7 @@ DELETE_WINDOW = timedelta(hours=1)
 def handle_delete_last_entry(message):
     try:
         user_id = str(message.from_user.id)
-        records = sheet.get_all_records()
+        records = sheet_cache
 
         # Scan for the last row belonging to this user. Since entries are
         # appended in order, the last match is the most recent one — we
@@ -314,6 +344,7 @@ def handle_delete_last_entry(message):
             return
 
         sheet.delete_rows(row_number)
+        del sheet_cache[target_index]  # keep the in-memory cache in sync
         bot.reply_to(message, f"🗑️ Deleted your last entry: \"{row_data.get('Meal', 'that meal')}\".")
 
     except Exception as e:
@@ -330,11 +361,47 @@ def handle_delete_command(message):
     handle_delete_last_entry(message)
 
 
+# HANDLER 2b: Manual cache refresh
+# Usage: /refresh — forces a full re-sync of the in-memory cache from the
+# sheet. Only needed if you've edited the sheet by hand outside the bot;
+# normal bot usage (photo -> price -> delete) keeps the cache in sync on
+# its own.
+@bot.message_handler(commands=['refresh'])
+def handle_refresh_cache(message):
+    try:
+        load_cache()
+        bot.reply_to(message, f"🔄 Cache refreshed — {len(sheet_cache)} rows loaded from the sheet.")
+    except Exception as e:
+        print(f"⚠️ Failed to refresh cache: {e}")
+        bot.reply_to(message, f"❌ Couldn't refresh the cache.\nReason: `{str(e)}`", parse_mode="Markdown")
+
+
+# Shared helper: pulls the numeric fields out of a sheet row safely.
+# Missing/blank values (e.g. Price wasn't logged for older entries) come
+# back as 0.0 rather than raising, so totals and charts degrade gracefully
+# instead of crashing on incomplete rows.
+def parse_row_values(row):
+    def to_float(key):
+        val = row.get(key, "")
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return 0.0
+
+    return {
+        "calories": to_float("Calories"),
+        "protein": to_float("Protein"),
+        "carbs": to_float("Carbs"),
+        "fat": to_float("Fats"),
+        "price": to_float("Price"),
+    }
+
+
 # HANDLER 3: Daily Tally Command
 # Usage:
 #   /total            -> tallies today's meals (SGT)
 #   /total 2026-09-09 -> tallies meals for that specific date (SGT)
-@bot.message_handler(commands=['total', 'today'])
+@bot.message_handler(commands=['total'])
 def handle_daily_total(message):
     try:
         user_id = str(message.from_user.id)
@@ -352,21 +419,21 @@ def handle_daily_total(message):
         else:
             target_date = now_sgt().strftime("%Y-%m-%d")
 
-        records = sheet.get_all_records()
+        records = sheet_cache  # in-memory cache, no full-table Sheets read
 
-        total_cal = total_protein = total_carbs = total_fat = 0.0
+        total_cal = total_protein = total_carbs = total_fat = total_price = 0.0
         meal_count = 0
 
         for row in records:
             row_date = str(row.get("Date", ""))[:10]
             row_user = str(row.get("Telegram_ID", ""))
             if row_date == target_date and row_user == user_id:
-                total_cal += float(row.get("Calories") or 0)
-                total_protein += float(row.get("Protein") or 0)
-                total_carbs += float(row.get("Carbs") or 0)
-                # Column is labeled "Fats" in the sheet; fall back to "Fat"
-                # just in case the header ever gets singularized.
-                total_fat += float(row.get("Fats", row.get("Fat")) or 0)
+                vals = parse_row_values(row)
+                total_cal += vals["calories"]
+                total_protein += vals["protein"]
+                total_carbs += vals["carbs"]
+                total_fat += vals["fat"]
+                total_price += vals["price"]
                 meal_count += 1
 
         if meal_count == 0:
@@ -379,7 +446,8 @@ def handle_daily_total(message):
             f"🔥 Calories: {total_cal:.0f} kcal\n"
             f"💪 Protein: {total_protein:.0f} g\n"
             f"🍞 Carbs: {total_carbs:.0f} g\n"
-            f"🥑 Fat: {total_fat:.0f} g"
+            f"🥑 Fat: {total_fat:.0f} g\n"
+            f"💰 Total spent: ${total_price:.2f}"
         )
         try:
             bot.reply_to(message, summary, parse_mode="Markdown")
@@ -395,7 +463,170 @@ def handle_daily_total(message):
             bot.reply_to(message, error_message)
 
 
-# HANDLER 4: Text Response Assistant
+def build_line_chart(title, x_labels, calories, protein, carbs, fat, price):
+    """
+    Builds a two-panel PNG chart and returns it as an in-memory buffer ready
+    for bot.send_photo().
+
+    Top panel: Calories on its own left axis, Protein/Carbs/Fat (grams) on
+    a shared right axis via twinx(). Bottom panel: Price on its own axis.
+    Splitting it this way keeps calories (hundreds) from squashing grams
+    (tens) or price (single/double digits) flat on one shared scale.
+    """
+    x = list(range(len(x_labels)))
+    fig, (ax_nutrition, ax_price) = plt.subplots(
+        2, 1, figsize=(8, 7), gridspec_kw={"height_ratios": [2, 1]}
+    )
+
+    ax_cal = ax_nutrition
+    ax_macro = ax_nutrition.twinx()
+
+    ax_cal.plot(x, calories, color="#e6550d", marker="o", label="Calories (kcal)")
+    ax_macro.plot(x, protein, color="#3182bd", marker="o", label="Protein (g)")
+    ax_macro.plot(x, carbs, color="#31a354", marker="o", label="Carbs (g)")
+    ax_macro.plot(x, fat, color="#756bb1", marker="o", label="Fat (g)")
+
+    ax_cal.set_ylabel("Calories (kcal)", color="#e6550d")
+    ax_macro.set_ylabel("Grams")
+    ax_cal.set_title(title)
+    ax_cal.set_xticks(x)
+    ax_cal.set_xticklabels(x_labels, fontsize=8)
+    ax_cal.grid(alpha=0.25)
+
+    lines_1, labels_1 = ax_cal.get_legend_handles_labels()
+    lines_2, labels_2 = ax_macro.get_legend_handles_labels()
+    ax_cal.legend(lines_1 + lines_2, labels_1 + labels_2, loc="upper left", fontsize=8)
+
+    ax_price.plot(x, price, color="#c51b8a", marker="o", label="Price ($)")
+    ax_price.set_ylabel("Price ($)")
+    ax_price.set_xticks(x)
+    ax_price.set_xticklabels(x_labels, fontsize=8)
+    ax_price.grid(alpha=0.25)
+    ax_price.legend(loc="upper left", fontsize=8)
+
+    fig.tight_layout()
+
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=150)
+    plt.close(fig)  # free the figure - important on a long-running server
+    buf.seek(0)
+    return buf
+
+
+# HANDLER 4: Daily Graph — nutrition & price across each meal in a day
+# Usage:
+#   /graphdaily            -> today's meals (SGT)
+#   /graphdaily 2026-09-09 -> meals for that specific date (SGT)
+@bot.message_handler(commands=['graphdaily'])
+def handle_graph_daily(message):
+    try:
+        user_id = str(message.from_user.id)
+
+        parts = message.text.strip().split(maxsplit=1)
+        if len(parts) > 1:
+            target_date = parts[1].strip()
+            try:
+                datetime.strptime(target_date, "%Y-%m-%d")
+            except ValueError:
+                bot.reply_to(message, "⚠️ Please use the format `/graphdaily YYYY-MM-DD`.", parse_mode="Markdown")
+                return
+        else:
+            target_date = now_sgt().strftime("%Y-%m-%d")
+
+        records = sheet_cache  # in-memory cache, no full-table Sheets read
+        day_rows = [
+            row for row in records
+            if str(row.get("Date", ""))[:10] == target_date and str(row.get("Telegram_ID", "")) == user_id
+        ]
+
+        if not day_rows:
+            bot.reply_to(message, f"No meals logged for {target_date}. 🍽️")
+            return
+
+        # Rows come out of the sheet in the order they were logged, which
+        # is already chronological, but sort explicitly to be safe.
+        day_rows.sort(key=lambda r: str(r.get("Date", "")))
+
+        labels, calories, protein, carbs, fat, price = [], [], [], [], [], []
+        for row in day_rows:
+            time_str = str(row.get("Date", ""))[11:16] or "?"
+            meal_name = str(row.get("Meal", "Meal"))[:14]
+            labels.append(f"{time_str}\n{meal_name}")
+            vals = parse_row_values(row)
+            calories.append(vals["calories"])
+            protein.append(vals["protein"])
+            carbs.append(vals["carbs"])
+            fat.append(vals["fat"])
+            price.append(vals["price"])
+
+        chart_buf = build_line_chart(
+            title=f"Meals on {target_date}",
+            x_labels=labels, calories=calories, protein=protein,
+            carbs=carbs, fat=fat, price=price
+        )
+        bot.send_photo(message.chat.id, chart_buf, caption=f"📈 Nutrition & spend across meals — {target_date}")
+
+    except Exception as e:
+        print(f"⚠️ Failed to build daily graph: {e}")
+        error_message = f"❌ *Couldn't build the daily graph*\n\nReason:\n`{str(e)}`"
+        try:
+            bot.reply_to(message, error_message, parse_mode="Markdown")
+        except telebot.apihelper.ApiTelegramException:
+            bot.reply_to(message, error_message)
+
+
+# HANDLER 5: Weekly Graph — daily totals over the last 7 days
+@bot.message_handler(commands=['graphweekly'])
+def handle_graph_weekly(message):
+    try:
+        user_id = str(message.from_user.id)
+        records = sheet_cache  # in-memory cache, no full-table Sheets read
+
+        today = now_sgt().date()
+        day_range = [today - timedelta(days=offset) for offset in range(6, -1, -1)]  # oldest -> newest
+
+        daily_totals = {
+            d.strftime("%Y-%m-%d"): {"calories": 0.0, "protein": 0.0, "carbs": 0.0, "fat": 0.0, "price": 0.0}
+            for d in day_range
+        }
+
+        for row in records:
+            if str(row.get("Telegram_ID", "")) != user_id:
+                continue
+            row_date = str(row.get("Date", ""))[:10]
+            if row_date in daily_totals:
+                vals = parse_row_values(row)
+                for key in daily_totals[row_date]:
+                    daily_totals[row_date][key] += vals[key]
+
+        if all(sum(day.values()) == 0 for day in daily_totals.values()):
+            bot.reply_to(message, "No meals logged in the past 7 days. 🍽️")
+            return
+
+        labels = [d.strftime("%a\n%d %b") for d in day_range]
+        calories = [daily_totals[d.strftime("%Y-%m-%d")]["calories"] for d in day_range]
+        protein = [daily_totals[d.strftime("%Y-%m-%d")]["protein"] for d in day_range]
+        carbs = [daily_totals[d.strftime("%Y-%m-%d")]["carbs"] for d in day_range]
+        fat = [daily_totals[d.strftime("%Y-%m-%d")]["fat"] for d in day_range]
+        price = [daily_totals[d.strftime("%Y-%m-%d")]["price"] for d in day_range]
+
+        chart_buf = build_line_chart(
+            title="Past 7 Days — Daily Totals",
+            x_labels=labels, calories=calories, protein=protein,
+            carbs=carbs, fat=fat, price=price
+        )
+        bot.send_photo(message.chat.id, chart_buf, caption="📈 Daily nutrition & spend totals — last 7 days")
+
+    except Exception as e:
+        print(f"⚠️ Failed to build weekly graph: {e}")
+        error_message = f"❌ *Couldn't build the weekly graph*\n\nReason:\n`{str(e)}`"
+        try:
+            bot.reply_to(message, error_message, parse_mode="Markdown")
+        except telebot.apihelper.ApiTelegramException:
+            bot.reply_to(message, error_message)
+
+
+# HANDLER 6: Text Response Assistant
 @bot.message_handler(content_types=['text'])
 def handle_text_fallback(message):
     feedback = (
@@ -403,7 +634,9 @@ def handle_text_fallback(message):
         "Please upload a **photo** of your plate. "
         "The AI will evaluate macros and save them straight to your tracking sheet! 📊\n\n"
         "Send /total to see today's tally, or /total YYYY-MM-DD for a specific day.\n"
-        "Uploaded the wrong photo? Send /delete within an hour to remove it."
+        "Send /graphdaily for a chart of today's meals, or /graphweekly for the last 7 days.\n"
+        "Uploaded the wrong photo? Send /delete within an hour to remove it.\n"
+        "Edited the sheet by hand? Send /refresh to re-sync."
     )
     bot.reply_to(message, feedback, parse_mode="Markdown")
 
@@ -460,11 +693,18 @@ if __name__ == "__main__":
     # purely cosmetic/discoverability — it doesn't affect routing, so the
     # @bot.message_handler(commands=[...]) handlers still do the real work.
     bot.set_my_commands([
-        telebot.types.BotCommand("total", "Today's nutrition tally"),
-        telebot.types.BotCommand("today", "Same as /total"),
+        telebot.types.BotCommand("total", "Today's nutrition & spend tally"),
+        telebot.types.BotCommand("graphdaily", "Graph today's meals"),
+        telebot.types.BotCommand("graphweekly", "Graph the last 7 days"),
         telebot.types.BotCommand("delete", "Delete your last entry (within 1h)"),
+        telebot.types.BotCommand("refresh", "Reload cache after a manual sheet edit"),
     ])
     print("✅ Command menu registered")
+
+    # Load the sheet into memory once here. From this point on, every
+    # command reads from sheet_cache instead of hitting the Sheets API,
+    # and bot-driven writes (photo log, price, delete) keep it in sync.
+    load_cache()
 
     print("🚀 Bot server running via webhook (no polling, no 409 conflicts)...")
     run_flask()  # run in the main thread now — this IS the server
