@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import time
 from datetime import datetime
 import telebot
 import google.genai as genai
@@ -66,6 +67,34 @@ def download_telegram_file(file_path: str, token: str, timeout: int = 15, retrie
     raise RuntimeError(f"Failed to download Telegram file after {retries} attempts: {last_error}")
 
 
+def generate_content_with_retry(client, model, contents, max_attempts=3):
+    """
+    Calls Gemini's generate_content with short exponential backoff, but only
+    retries on transient overload (503 UNAVAILABLE) or connection/timeout
+    errors. Other errors (e.g. 404 bad model name, 400 bad request) fail
+    immediately since retrying them would just waste time on a guaranteed
+    repeat failure.
+
+    Backoff schedule: 2s, then 4s between attempts (worst case ~6s added
+    before giving up on attempt 3).
+    """
+    delay = 2
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return client.models.generate_content(model=model, contents=contents)
+        except Exception as e:
+            error_text = str(e)
+            is_transient = "503" in error_text or "UNAVAILABLE" in error_text or "overloaded" in error_text.lower()
+            last_error = e
+            if not is_transient or attempt == max_attempts:
+                raise
+            print(f"⚠️ Gemini overloaded (attempt {attempt}/{max_attempts}), retrying in {delay}s...")
+            time.sleep(delay)
+            delay *= 2
+    raise last_error
+
+
 SYSTEM_PROMPT = """
 You are an expert nutritionist AI. Analyze the uploaded meal photo or text.
 Estimate portion sizes and calculate macros. 
@@ -93,15 +122,15 @@ def handle_food_photo(message):
         file_bytes = download_telegram_file(file_info.file_path, TELEGRAM_TOKEN)
         img = Image.open(BytesIO(file_bytes))
         
-        ai_response = client_ai.models.generate_content(
-            # Using the rolling alias instead of a pinned version so this
-            # doesn't need manual updates every time Google retires a model.
-            # Trade-off: Google has, in the past, let this alias point at a
-            # model that was later deprecated, which reintroduces a 404 until
-            # Google repoints the alias. If that happens, check
-            # https://ai.google.dev/gemini-api/docs/changelog for the current
-            # recommended Flash model and pin to it directly as a workaround.
-            model='gemini-flash-latest',
+        ai_response = generate_content_with_retry(
+            client_ai,
+            # Rolling alias on the Flash-Lite tier: cheaper, faster, and
+            # generally has more headroom during high-demand periods than
+            # full Flash, so fewer 503 UNAVAILABLE errors. Same alias-drift
+            # trade-off as gemini-flash-latest applies (see note above) -
+            # check https://ai.google.dev/gemini-api/docs/changelog if this
+            # ever 404s again.
+            model='gemini-flash-lite-latest',
             contents=[img, SYSTEM_PROMPT]
         )
         full_text = ai_response.text
