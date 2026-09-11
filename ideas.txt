@@ -1,0 +1,231 @@
+CALORIE TRACKER BOT — IDEA LOG
+Last updated: 2026-09-11
+Purpose: a running record of features we've brainstormed but not yet built,
+including feasibility findings and limitations, so future work doesn't
+re-litigate the same research.
+
+===============================================================================
+1. USER PROFILES (weight, height, dietary goals, AI-suggested targets)
+===============================================================================
+STATUS: Feasible, medium effort. Not yet implemented.
+
+Plan discussed:
+- New tab in the existing Google Sheet ("Profiles"), one row per Telegram_ID.
+  Columns: Weight, Height, Age, Sex, Activity_Level, Goal (cut/maintain/bulk),
+  computed Target_Calories/Protein/Carbs/Fat.
+- /setprofile: a conversational multi-step flow (same register_next_step_handler
+  pattern as the existing price follow-up) asking one question at a time.
+- /profile: view current saved profile.
+
+IMPORTANT DESIGN NOTE:
+- Compute BMR/TDEE and calorie targets with a standard formula
+  (Mifflin-St Jeor + activity multiplier + goal offset) in plain Python code,
+  NOT by asking Gemini to do the arithmetic. LLMs are not reliable at
+  consistent multi-step numeric calculation. Use Gemini only for the
+  narrative/explanatory layer on top of numbers you've already computed
+  deterministically.
+- Natural follow-on: once a profile exists, /total could show progress
+  against target (e.g. "320 kcal under your daily goal").
+
+LIMITATIONS:
+- None structural — this is a straightforward extension of what's already
+  built (same sheet, same bot patterns). Main cost is implementation time.
+
+===============================================================================
+2. WORKOUT / CALORIE-BURN INTEGRATION (for net calorie tracking)
+===============================================================================
+STATUS: Mixed. Each provider researched has a real catch — see below.
+Researched as of 2026-09; API terms and access policies change, so re-verify
+before implementing.
+
+--- Strava ---
+- Has a real API, but as of a June 2026 policy change:
+  1. Standard-tier API access now requires the DEVELOPER to hold an active
+     Strava subscription ($11.99/month) — a new ongoing cost.
+  2. Strava's terms now explicitly BAN using Strava data "in connection with
+     the development, training, evaluation, or operation of any AI
+     Application" — specifically naming retrieval-augmented generation and
+     "ingestion into a context window."
+- RISK: This bot is built around Gemini. Even without literally piping the
+  calorie number into a Gemini prompt, using Strava data anywhere inside an
+  app whose core operation involves AI is a real ToS gray area, not just a
+  hypothetical concern. Treat as a likely blocker, not a footnote.
+
+--- Garmin ---
+- Essentially closed to individuals. The Garmin Connect Developer Program
+  requires applying as a legal business entity; personal-use apps are
+  explicitly rejected. The program is also currently suspended for new
+  applicants. Garmin deployed stronger anti-bot detection in March 2026 that
+  broke the unofficial community libraries people used as a workaround.
+- VERDICT: Not realistically available right now for a personal project.
+
+--- Hevy ---
+- Simple API key auth (no OAuth flow), requires a Hevy Pro subscription.
+- No explicit AI-use restriction found (unlike Strava).
+- OPEN QUESTION: Hevy is a strength-training logger (sets/reps/weight) — it's
+  NOT confirmed whether its API actually returns a calibrated calorie-burn
+  estimate the way a GPS/HR-based cardio platform would. Needs a closer look
+  at their API docs before relying on it for net-calorie math.
+
+--- RECOMMENDATION (as discussed) ---
+Start with either:
+(a) verifying whether Hevy's API actually exposes usable calorie data, or
+(b) the simple fallback: a manual /workout command where the user just tells
+    the bot "ran 5k, ~400 kcal" and it logs a negative offset. No third-party
+    accounts, no OAuth, no ToS ambiguity, immediate net-calorie tracking.
+Hevy (or another provider) could be layered on top later once proven to fit.
+
+===============================================================================
+3. MULTI-MODEL "PANEL" ESTIMATION (to reduce calorie estimation error)
+===============================================================================
+STATUS: Feasible as a supplementary layer. Not yet implemented.
+
+BACKGROUND:
+- Confirmed via research: single 2D photo (no depth camera, no reference
+  object) calorie estimation has documented error ranges from ~0.1% to 38%,
+  worse for complex/mixed plates than single simple foods. High-accuracy
+  systems (3-5% error) typically use depth cameras or calibrated setups —
+  not a single phone photo.
+
+KEY DISTINCTION — noise vs. bias:
+- A panel of models reduces RANDOM NOISE (model-to-model variance on reading
+  the same ambiguous photo) via averaging.
+- It does NOT reliably fix SYSTEMATIC BIAS — the structural fact that no
+  vision model can judge portion depth/volume from a flat 2D photo with no
+  size reference. If every model in the panel shares the same blind spot
+  (same photo, same missing depth info), their errors are correlated, not
+  independent, and averaging correlated wrong answers doesn't converge on
+  the right one.
+- CONCLUSION: worthwhile, but expect it to tighten the noise band, not solve
+  the core accuracy ceiling.
+
+MORE EFFECTIVE MITIGATIONS (recommended to try before/alongside a panel):
+1. Reference object in-frame (a fork, a coin) for real scale/depth info —
+   cheapest, most effective single lever. Just a prompt change.
+2. Let the user correct the AI's estimate before it's logged (human-in-loop)
+   — the user knows more about their own meal than any photo can convey.
+3. Model panel / ensemble — best used to FLAG low-confidence meals (models
+   disagree a lot) rather than to quietly produce one "more correct" number.
+
+FREE-TIER PROVIDER OPTIONS RESEARCHED (2026, verify before use — these shift
+often):
+- Google Gemini (already in use) — free tier exists, but Google cut free-tier
+  RPM by ~50-80% in late 2025 (now roughly 10-15 RPM).
+- OpenAI direct — no standing free tier, only small time-limited trial credits.
+- Anthropic (Claude) direct — same, no permanent free API tier, trial credits
+  only.
+- GitHub Models — free, Azure-backed endpoint giving access to GPT-4o,
+  GPT-4.1, and Claude 3.5 Sonnet, tied to a GitHub account (rate limits scale
+  with Copilot tier — verify current numbers). Best route to real model-family
+  diversity (different labs) without new OpenAI/Anthropic billing.
+- Groq — generous free tier, no card required. Hosts Llama 4 Scout, which is
+  natively multimodal/vision-capable. Good free, architecturally distinct
+  option.
+- Mistral — very generous ~1B tokens/month free, but requires opting into
+  data training to get it — worth flagging given photos of personal meals
+  would be sent through it. Has a vision model family (Pixtral); free-tier
+  availability of Pixtral specifically not confirmed, needs checking.
+- Cohere — free trial keys (rate-limited, meant for evaluation, not sustained
+  use). command-a-plus described as vision-capable.
+
+IMPLEMENTATION NOTE:
+- Most of the above (Groq, Mistral, Cohere, GitHub Models, OpenRouter) expose
+  OpenAI-COMPATIBLE endpoints — meaning the same `openai` Python client can
+  hit all of them, just swapping base_url / api_key / model. Lowers the
+  integration cost of a multi-provider panel significantly.
+
+SUGGESTED STARTING PANEL (genuine diversity, zero added cost):
+1. Gemini (already have it)
+2. GPT-4o or GPT-4.1 via GitHub Models (different lab, free)
+3. Llama 4 Scout via Groq (different lab, open-weight, free)
+Wouldn't go much wider than this — more providers = more integration surface
+and more things that can silently rate-limit or change.
+
+BONUS: spreading photo-analysis load across multiple free providers doesn't
+just help accuracy — it also multiplies the bot's combined free-tier request
+budget, which directly helps with the multi-user capacity question below.
+
+===============================================================================
+4. SCALING TO MULTIPLE (FRIEND-GROUP) USERS ON FREE HOSTING
+===============================================================================
+STATUS: Analyzed, partially actionable now, partially requires the gunicorn
+change below.
+
+CONFIRMED CURRENT LIMITS (2026, re-verify before relying on these):
+- Render free tier: 512 MB RAM, 0.1 CPU, spins down after ~15 min inactivity
+  (mitigated by the cron-job.org pinger).
+- Google Sheets API: 300 reads/min and 300 writes/min per PROJECT, but only
+  60 reads/min and 60 writes/min per SERVICE ACCOUNT ("per user" in Google's
+  terms) — since this bot uses one service account for all Telegram users,
+  everyone's activity shares that same 60/60 bucket. After the in-memory
+  cache was added, reads barely touch the API anymore, so writes (1-2 per
+  meal logged) are the main quota consumer — roughly 30 meal-logs/minute of
+  headroom across ALL users combined. Comfortable for a friend group.
+- Gemini free tier: ~10-15 RPM (see section 3) — THIS is the tightest
+  constraint on simultaneous throughput, not Sheets or Render.
+
+BOTTLENECKS, roughly in order of tightness:
+1. Gemini free-tier RPM — caps how many photo analyses can complete per
+   minute, regardless of total user count.
+2. Flask's single-threaded dev server (`app.run()` without a WSGI server) —
+   processes one webhook update at a time; a slow request (waiting on
+   Gemini) blocks everyone else's messages behind it.
+3. Google Sheets per-service-account quota — not a real concern post-cache,
+   flagged for completeness.
+4. Render RAM/CPU — not the limiting factor at friend-group scale.
+
+ROUGH CAPACITY ESTIMATE:
+- Casual, staggered use (a handful of friends, a few meals/day each, not
+  synchronized): comfortably 10-20 people as-is.
+- Simultaneous bursts (many people uploading within the same minute or two):
+  this is where Gemini's RPM ceiling and single-threaded Flask start to show
+  as lag or dropped/retried requests, regardless of total user count.
+
+WAYS TO RAISE THE CEILING WITHOUT LEAVING FREE HOSTING:
+1. Switch Flask's dev server for `gunicorn` with THREADS (not multiple
+   worker PROCESSES) — see section 5 below, this is the highest-value fix.
+2. Acknowledge the Telegram webhook immediately, process the photo in a
+   background thread — decouples "tell Telegram we got it" from "wait on
+   Gemini," reducing retry storms under load.
+3. Extend the existing Gemini retry logic (currently only handles 503/
+   overloaded) to also handle 429 rate-limit errors with backoff, so a
+   burst degrades gracefully instead of erroring for unlucky users.
+4. The multi-model panel (section 3) doubles as a capacity multiplier —
+   spreading load across providers raises the combined free-tier budget.
+
+===============================================================================
+5. GUNICORN / CONCURRENCY FIX (prerequisite for scaling further)
+===============================================================================
+STATUS: Scoped, not yet implemented (deliberately held off per project
+decision on 2026-09-11).
+
+WHAT CHANGES:
+- Render dashboard: Start Command changes from `python main.py` to something
+  like `gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 --threads 4
+  --timeout 60`. One field, no plan/tier change.
+- `requirements.txt`: add `gunicorn`.
+- Code: startup logic currently inside `if __name__ == "__main__":`
+  (webhook registration, set_my_commands(), load_cache()) must move to
+  execute at module import time — gunicorn imports main.py and reaches
+  directly for the `app` object, it never runs that block.
+- The old `run_flask()` / `app.run(...)` becomes dead code under gunicorn and
+  should be removed or clearly marked unused.
+
+CRITICAL DECISION — workers vs threads:
+- MUST use `--workers 1 --threads N`, NOT multiple worker processes.
+- Reason: `--workers` spins up separate OS processes, each with its own
+  independent memory. sheet_cache (and telebot's register_next_step_handler
+  state for the price-follow-up flow) live in process memory — multiple
+  worker processes would each get their own out-of-sync copy, causing subtle
+  data bugs (e.g. a delete on one worker not reflected in another's cache).
+- Threads within a single process share memory correctly and still allow
+  concurrent handling of I/O-bound waits (Gemini, Sheets, Telegram), which is
+  exactly what's needed here — most of the wait time is network I/O, not CPU.
+
+===============================================================================
+GENERAL NOTE
+===============================================================================
+Several sections above depend on third-party API terms, rate limits, and
+pricing that are known to change (Strava's June 2026 policy shift and
+Gemini's late-2025 rate-limit cut are both examples from this same log).
+Re-verify current terms before implementing anything in sections 2-3.
